@@ -32,10 +32,10 @@ b64url_decode() {
 }
 
 echo "== Check 1: Variables =="
-echo "KEYCLOAK_URL:   [${KEYCLOAK_URL}]"
-echo "REALM:          [${REALM}]"
-echo "CLIENT_ID:      [${CLIENT_ID}]"
-echo "CLIENT_SECRET:  [${CLIENT_SECRET:0:4}...] (length=${#CLIENT_SECRET})"
+echo "KEYCLOAK_URL:     [${KEYCLOAK_URL}]"
+echo "REALM:            [${REALM}]"
+echo "CLIENT_ID:        [${CLIENT_ID}]"
+echo "CLIENT_SECRET:    [${CLIENT_SECRET:0:4}...] (length=${#CLIENT_SECRET})"
 echo "NIFI_METRICS_URL: [${NIFI_METRICS_URL}]"
 
 for var in KEYCLOAK_URL REALM CLIENT_ID CLIENT_SECRET NIFI_METRICS_URL; do
@@ -101,24 +101,13 @@ if [[ "$kc_code" != "200" ]]; then
       echo "DIAGNOSIS: client_id '${CLIENT_ID}' not found in realm '${REALM}'"
       echo "  OR client_secret is wrong"
       echo "  OR Client authentication is OFF (must be ON)"
-      echo ""
-      echo "ACTION:"
-      echo "  1. Open Keycloak -> realm '${REALM}' -> Clients"
-      echo "  2. Verify client '${CLIENT_ID}' exists"
-      echo "  3. Open client -> Settings -> Client authentication must be ON"
-      echo "  4. Open client -> Credentials -> copy Client secret"
-      echo "  5. Compare with what you have (length=${#CLIENT_SECRET})"
       ;;
     unauthorized_client)
-      echo "DIAGNOSIS: grant_type=client_credentials not allowed for this client"
-      echo ""
-      echo "ACTION:"
-      echo "  1. Open client '${CLIENT_ID}' -> Settings"
-      echo "  2. Enable 'Service accounts roles' in Authentication flow"
+      echo "DIAGNOSIS: grant_type=client_credentials not allowed"
+      echo "ACTION: enable 'Service accounts roles' for client '${CLIENT_ID}'"
       ;;
     invalid_grant)
       echo "DIAGNOSIS: grant type rejected"
-      echo ""
       echo "ACTION: enable 'Service accounts roles' for client '${CLIENT_ID}'"
       ;;
     *)
@@ -136,13 +125,17 @@ echo ""
 echo "== Check 4: Token payload =="
 b64url_decode "$(echo "$ACCESS_TOKEN" | cut -d'.' -f2)" > "$tmp/payload"
 
-for field in iss aud azp sub scope exp; do
+for field in iss aud azp sub scope exp preferred_username; do
   val="$(grep -oE "\"${field}\":[^,}]+" "$tmp/payload" | head -1 | sed "s/\"${field}\"://" || true)"
   echo "${field}: ${val:-NOT_FOUND}"
 done
 
 echo "realm_access: $(grep -oE '"realm_access":\{[^}]*\}' "$tmp/payload" || echo 'NOT_FOUND')"
 echo "resource_access: $(grep -oE '"resource_access":\{.*\}' "$tmp/payload" | head -c 500 || echo 'NOT_FOUND')"
+echo ""
+
+echo "== TOKEN (full) =="
+echo "$ACCESS_TOKEN"
 echo ""
 
 echo "== Check 5: NiFi request =="
@@ -158,6 +151,8 @@ echo "HTTP $nf_code"
 if [[ "$nf_code" != "200" ]]; then
   echo "-- WWW-Authenticate --"
   grep -i '^WWW-Authenticate' "$tmp/nf.h" 2>/dev/null || echo "(not present)"
+  echo "-- response headers --"
+  cat "$tmp/nf.h" 2>/dev/null || true
   echo "-- response body (first 2000 chars) --"
   head -c 2000 "$tmp/nf.b" 2>/dev/null; echo ""
   echo ""
@@ -165,21 +160,28 @@ if [[ "$nf_code" != "200" ]]; then
   case "$nf_code" in
     401)
       echo "DIAGNOSIS: NiFi rejected the token"
+      aud="$(grep -oE '"aud":[^,}]+' "$tmp/payload" | head -1 || true)"
+      iss="$(grep -oE '"iss":"[^"]+"' "$tmp/payload" | head -1 || true)"
+      echo "  token aud: ${aud:-NOT_FOUND}"
+      echo "  token iss: ${iss:-NOT_FOUND}"
       echo ""
-      echo "LIKELY CAUSES:"
-      aud="$(grep -oE '"aud":"[^"]+"' "$tmp/payload" | head -1 || true)"
-      echo "  1. aud in token is: ${aud:-NOT_FOUND}"
-      echo "     If it does not contain NiFi client_id -> add Audience mapper in Keycloak"
-      echo "  2. iss mismatch: NiFi expects different issuer URL"
-      echo "  3. NiFi OIDC discovery URL does not match this Keycloak"
+      echo "ACTIONS:"
+      echo "  1. Check nifi.security.user.oidc.client.id in nifi.properties"
+      echo "  2. That client_id must appear in 'aud' field above"
+      echo "  3. If not -> add Audience mapper in Keycloak for client '${CLIENT_ID}'"
+      echo "  4. Copy the full token above and test manually:"
+      echo "     curl -k -H 'Authorization: Bearer <token>' '${NIFI_METRICS_URL}'"
       ;;
     403)
       echo "DIAGNOSIS: token accepted but insufficient permissions"
-      echo ""
       echo "ACTION: assign NiFi roles to service account of '${CLIENT_ID}'"
       ;;
     000|"")
       echo "DIAGNOSIS: cannot connect to NiFi (DNS/network/TLS/firewall)"
+      ;;
+    302)
+      echo "DIAGNOSIS: NiFi redirects to login page (token not recognized as valid)"
+      echo "  Same as 401 — check aud, iss, audience mapper"
       ;;
     *)
       echo "DIAGNOSIS: unexpected HTTP $nf_code, see response above"
