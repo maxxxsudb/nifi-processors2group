@@ -1,10 +1,3 @@
-export KEYCLOAK_URL='https://keycloak.example.com' \
-       REALM='your-realm' \
-       CLIENT_ID='nifi-metrics' \
-       CLIENT_SECRET='your-secret-here' \
-       NIFI_METRICS_URL='https://nifi.example.com/nifi-api/controller/cluster' \
-       INSECURE='1'
----
 #!/usr/bin/env bash
 set -euo pipefail
 
