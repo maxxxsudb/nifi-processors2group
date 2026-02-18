@@ -1,10 +1,7 @@
-
-
-```groovy
 // ==========================================================================
 // НАСТРОЙКИ
 // ==========================================================================
-def TARGET_GROUPS = ["Data Ingest", "Kafka Processing", "My Group Name"]
+def TARGET_GROUPS = ["Data Ingest", "Kafka Processing", "[BUS]_diss_groups"]
 
 // ==========================================================================
 // ЛОГИКА
@@ -24,8 +21,8 @@ if (rootGroupStatus == null) {
     return
 }
 
-// Map: имя группы → список найденных ID (для отслеживания дубликатов)
-def foundGroups = [:].withDefault { [] }
+def foundGroups = [] as Set
+def foundTargetGroupIdsByName = [:].withDefault { [] }
 
 def collectAllProcessorIds
 collectAllProcessorIds = { groupStatus ->
@@ -43,16 +40,27 @@ collectAllProcessorIds = { groupStatus ->
 
 def findTargets
 findTargets = { groupStatus ->
-    if (TARGET_GROUPS.contains(groupStatus.name)) {
-        foundGroups[groupStatus.name].add(groupStatus.id)
+    if (groupStatus == null) return
 
-        // Предупреждение о дубликате сразу при обнаружении
-        if (foundGroups[groupStatus.name].size() > 1) {
-            println "WARNING: Duplicate group '${groupStatus.name}' found! GroupId='${groupStatus.id}' (occurrence #${foundGroups[groupStatus.name].size()})"
+    // 1) Если это целевая группа — выводим
+    if (TARGET_GROUPS.contains(groupStatus.name)) {
+        foundGroups.add(groupStatus.name)
+
+        // Дубликаты по имени: name -> список найденных groupId
+        def prevIds = foundTargetGroupIdsByName[groupStatus.name]
+        if (prevIds && !prevIds.contains(groupStatus.id)) {
+            println(
+                "WARNING: Duplicate target group name found. " +
+                "Group='${groupStatus.name}' " +
+                "GroupId='${groupStatus.id}' " +
+                "PreviousGroupIds='${prevIds.join(",")}'"
+            )
+        }
+        if (!prevIds.contains(groupStatus.id)) {
+            prevIds << groupStatus.id
         }
 
         def allIds = collectAllProcessorIds(groupStatus)
-
         if (!allIds.isEmpty()) {
             def queryPart = "(" + allIds.join(" OR ") + ")"
             println(
@@ -63,20 +71,23 @@ findTargets = { groupStatus ->
                 "Query='" + queryPart + "'"
             )
         } else {
-            println "GRAFANA_EXPORT Group='" + groupStatus.name + "' GroupId='" + groupStatus.id + "' Result=Empty"
+            println "GRAFANA_EXPORT Group='${groupStatus.name}' GroupId='${groupStatus.id}' Result=Empty"
         }
-        return
     }
 
+    // 2) Всегда идём вглубь — находим вложенные целевые группы
     (groupStatus.processGroupStatus ?: []).each { child ->
         findTargets(child)
     }
 }
 
+// ==========================================================================
+// ЗАПУСК
+// ==========================================================================
 println "--- Starting Scan for groups: ${TARGET_GROUPS} ---"
 findTargets(rootGroupStatus)
 
-def missingGroups = TARGET_GROUPS.findAll { !foundGroups.containsKey(it) }
+def missingGroups = TARGET_GROUPS.findAll { !foundGroups.contains(it) }
 if (missingGroups) {
     missingGroups.each { name ->
         println "WARNING: Group '${name}' was NOT found in the NiFi flow"
@@ -84,23 +95,3 @@ if (missingGroups) {
 }
 
 println "--- Scan Complete. Found ${foundGroups.size()}/${TARGET_GROUPS.size()} groups ---"
-```
-
-## Что изменилось
-
-| Было | Стало |
-|---|---|
-| `def foundGroups = [] as Set` | `def foundGroups = [:].withDefault { [] }` — Map, хранящий список ID для каждого имени |
-| Дубликаты молча терялись | При повторном нахождении — сразу `WARNING: Duplicate group '...' found!` с указанием `GroupId` и номера вхождения |
-| `TARGET_GROUPS - foundGroups` | `TARGET_GROUPS.findAll { !foundGroups.containsKey(it) }` — корректная проверка по Map |
-
-## Пример вывода при дубликате
-
-```
---- Starting Scan for groups: [Data Ingest, Kafka Processing, My Group Name] ---
-GRAFANA_EXPORT Group='Data Ingest' GroupId='a1b2c3d4-...' ProcessorCount=12 Query='(...)'
-WARNING: Duplicate group 'Data Ingest' found! GroupId='f9e8d7c6-...' (occurrence #2)
-GRAFANA_EXPORT Group='Data Ingest' GroupId='f9e8d7c6-...' ProcessorCount=3 Query='(...)'
-WARNING: Group 'My Group Name' was NOT found in the NiFi flow
---- Scan Complete. Found 2/3 groups ---
-```
