@@ -2,13 +2,12 @@
 // НАСТРОЙКИ
 // ==========================================================================
 def TARGET_GROUPS = ["Data Ingest", "Kafka Processing", "[BUS]_diss_groups"]
-def DEBUG_ON_MISSING = true
 
-// Единый тег, по которому фильтруете в Grafana
 def TAG = "DEBUG_NIFI"
+def DEBUG_PRINT_ROOT_GROUPS = false  // true, если хотите увидеть группы верхнего уровня
 
 // ==========================================================================
-// ЛОГИКА
+// ROOT STATUS
 // ==========================================================================
 def eventAccess = context.getEventAccess()
 
@@ -24,11 +23,13 @@ try {
 }
 
 if (rootGroupStatus == null) {
-    println "${TAG} Level=ERROR Msg='Could not obtain root group status'"
+    println "${TAG} Level=ERROR Type=Init Msg='Could not obtain root group status'"
     return
 }
 
-// Нормализация имён (лечит NBSP и хвостовые пробелы)
+// ==========================================================================
+// HELPERS
+// ==========================================================================
 def normalizeName = { String s ->
     if (s == null) return null
     s.replace('\u00A0', ' ')
@@ -36,13 +37,7 @@ def normalizeName = { String s ->
      .trim()
 }
 
-// Карта: нормализованное имя -> исходное имя из TARGET_GROUPS
-def targetByNormalized = [:]
-TARGET_GROUPS.each { t -> targetByNormalized[normalizeName(t)] = t }
-
-def foundGroups = [] as Set
-def foundTargetGroupIdsByName = [:].withDefault { [] }
-
+// Собрать processor IDs во всей глубине выбранной группы
 def collectAllProcessorIds
 collectAllProcessorIds = { groupStatus ->
     def ids = []
@@ -57,70 +52,62 @@ collectAllProcessorIds = { groupStatus ->
     return ids
 }
 
-def findTargets
-findTargets = { groupStatus ->
+// ==========================================================================
+// 1) Индексация всех групп: name(normalized) -> список groupStatus
+// ==========================================================================
+def groupsByNormName = [:].withDefault { [] }
+
+def indexGroups
+indexGroups = { groupStatus ->
     if (groupStatus == null) return
 
-    def realName = groupStatus.name
-    def normName = normalizeName(realName)
-
-    if (targetByNormalized.containsKey(normName)) {
-        def targetName = targetByNormalized[normName]
-        foundGroups.add(targetName)
-
-        // Совпало только после нормализации (если вдруг есть невидимые пробелы)
-        if (realName != targetName) {
-            println "${TAG} Level=WARN Type=NormalizeMatch Target='${targetName}' Actual='${realName}' ActualLen=${realName?.length()} GroupId='${groupStatus.id}'"
-        }
-
-        // Дубликаты целевых групп по имени
-        def prevIds = foundTargetGroupIdsByName[targetName]
-        if (prevIds && !prevIds.contains(groupStatus.id)) {
-            println "${TAG} Level=WARN Type=DuplicateTargetName Group='${targetName}' GroupId='${groupStatus.id}' PreviousGroupIds='${prevIds.join(",")}'"
-        }
-        if (!prevIds.contains(groupStatus.id)) prevIds << groupStatus.id
-
-        def allIds = collectAllProcessorIds(groupStatus)
-        if (!allIds.isEmpty()) {
-            def queryPart = "(" + allIds.join(" OR ") + ")"
-            println "${TAG} Level=INFO Type=Export Group='${targetName}' GroupId='${groupStatus.id}' ProcessorCount=${allIds.size()} Query='${queryPart}'"
-        } else {
-            println "${TAG} Level=INFO Type=Export Group='${targetName}' GroupId='${groupStatus.id}' Result=Empty"
-        }
-    }
+    def norm = normalizeName(groupStatus.name)
+    groupsByNormName[norm] << groupStatus
 
     (groupStatus.processGroupStatus ?: []).each { child ->
-        findTargets(child)
+        indexGroups(child)
     }
 }
 
-// ==========================================================================
-// ЗАПУСК
-// ==========================================================================
 println "${TAG} Level=INFO Type=Start TargetGroups='${TARGET_GROUPS}'"
-findTargets(rootGroupStatus)
+indexGroups(rootGroupStatus)
 
-def missingGroups = TARGET_GROUPS.findAll { !foundGroups.contains(it) }
-missingGroups.each { name ->
-    println "${TAG} Level=WARN Type=NotFound Group='${name}'"
-}
-
-if (missingGroups && DEBUG_ON_MISSING) {
-    println "${TAG} Level=DEBUG Type=RootChildrenProcessGroups Count=${(rootGroupStatus.processGroupStatus ?: []).size()}"
+// (опционально) список корневых групп
+if (DEBUG_PRINT_ROOT_GROUPS) {
     (rootGroupStatus.processGroupStatus ?: []).each { g ->
-        def n = g.name
-        println "${TAG} Level=DEBUG Type=RootPG Name='${n}' Len=${n?.length()} Id='${g.id}'"
-    }
-
-    // Если у вас “группа на канвасе” на самом деле Remote Process Group
-    def rootRpg = []
-    try { rootRpg = (rootGroupStatus.remoteProcessGroupStatus ?: []) } catch (ignored) { rootRpg = [] }
-
-    println "${TAG} Level=DEBUG Type=RootChildrenRemoteProcessGroups Count=${rootRpg.size()}"
-    rootRpg.each { r ->
-        def n = r.name
-        println "${TAG} Level=DEBUG Type=RootRPG Name='${n}' Len=${n?.length()} Id='${r.id}'"
+        println "${TAG} Level=DEBUG Type=RootPG Name='${g.name}' Norm='${normalizeName(g.name)}' GroupId='${g.id}'"
     }
 }
 
-println "${TAG} Level=INFO Type=Complete Found=${foundGroups.size()} Total=${TARGET_GROUPS.size()}"
+// ==========================================================================
+// 2) Выбор target-групп из индекса + экспорт процессоров
+// ==========================================================================
+def foundTargetNames = [] as Set
+
+TARGET_GROUPS.each { target ->
+    def normTarget = normalizeName(target)
+    def matches = groupsByNormName[normTarget] ?: []
+
+    if (matches.isEmpty()) {
+        println "${TAG} Level=WARN Type=NotFound Group='${target}'"
+        return
+    }
+
+    foundTargetNames.add(target)
+
+    if (matches.size() > 1) {
+        println "${TAG} Level=WARN Type=DuplicateTargetName Group='${target}' MatchCount=${matches.size()} GroupIds='${matches.collect{it.id}.join(",")}'"
+    }
+
+    matches.each { grp ->
+        def allIds = collectAllProcessorIds(grp)
+        if (!allIds.isEmpty()) {
+            def queryPart = "(" + allIds.join(" OR ") + ")"
+            println "${TAG} Level=INFO Type=Export Group='${target}' ActualName='${grp.name}' GroupId='${grp.id}' ProcessorCount=${allIds.size()} Query='${queryPart}'"
+        } else {
+            println "${TAG} Level=INFO Type=Export Group='${target}' ActualName='${grp.name}' GroupId='${grp.id}' Result=Empty"
+        }
+    }
+}
+
+println "${TAG} Level=INFO Type=Complete Found=${foundTargetNames.size()} Total=${TARGET_GROUPS.size()}"
