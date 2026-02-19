@@ -1,13 +1,17 @@
+```groovy
 // ==========================================================================
 // CONFIG
 // ==========================================================================
 def TAG  = "DEBUG_NIFI"
 def MODE = "EXPORT"              // EXPORT | DUMP_ALL_GROUPS | DUMP_ROOT_CHILDREN
 
-def TARGET_GROUPS = ["Data Ingest", "Kafka Processing", "[Bus]_Business_groups"]  // <-- исправьте на точное имя
+def TARGET_GROUPS = ["Data Ingest", "Kafka Processing", "[Bus]_Business_groups"]
 
 // Если хотите матчить без учёта регистра: true
 def CASE_INSENSITIVE = false
+
+// Сколько processorId максимум включать в Query (regex). 0/отрицательное = без лимита.
+def MAX_PROCESSORS_IN_QUERY = 100   // например 70 или 100
 
 // ==========================================================================
 // LOG HELPERS (println only)
@@ -69,7 +73,12 @@ def getProcessors = { groupStatus ->
 // MAIN
 // ==========================================================================
 try {
-    logLine("INFO", "Start", [Mode: MODE, TargetGroups: TARGET_GROUPS, CaseInsensitive: CASE_INSENSITIVE])
+    logLine("INFO", "Start", [
+        Mode: MODE,
+        TargetGroups: TARGET_GROUPS,
+        CaseInsensitive: CASE_INSENSITIVE,
+        MaxProcessorsInQuery: MAX_PROCESSORS_IN_QUERY
+    ])
 
     def eventAccess = context?.getEventAccess()
     if (eventAccess == null) {
@@ -113,7 +122,6 @@ try {
     walkGroups = { groupStatus, String parentId, int depth, Closure visitor ->
         if (groupStatus == null) return
 
-        // На всякий случай: если сюда всё же прилетел список — развернём
         if (isCollectionLike(groupStatus)) {
             asList(groupStatus).each { node -> walkGroups(node, parentId, depth, visitor) }
             return
@@ -233,16 +241,31 @@ try {
             def grpName = safeProp(grp, "name")
 
             def allIds = collectAllProcessorIds(grp)
-            if (allIds.isEmpty()) {
+            def totalCount = allIds.size()
+
+            if (totalCount == 0) {
                 logLine("INFO", "Export", [Group: target, ActualName: grpName, GroupId: grpId, Result: "Empty"])
-            } else {
-                def queryPart = "(" + allIds.join(" OR ") + ")"
-                logLine("INFO", "Export", [
-                    Group: target, ActualName: grpName, GroupId: grpId,
-                    ProcessorCount: allIds.size(),
-                    Query: queryPart
-                ])
+                return
             }
+
+            def limit = (MAX_PROCESSORS_IN_QUERY != null ? (MAX_PROCESSORS_IN_QUERY as int) : 0)
+            def shownIds = (limit > 0) ? allIds.take(limit) : allIds
+
+            def shownCount = shownIds.size()
+            def truncated = (shownCount < totalCount)
+
+            // Regex для Loki: (id1|id2|id3)
+            def queryRegex = "(" + shownIds.join("|") + ")"
+
+            logLine("INFO", "Export", [
+                Group: target,
+                ActualName: grpName,
+                GroupId: grpId,
+                ProcessorCount: totalCount,
+                ProcessorInQuery: shownCount,
+                Truncated: truncated,
+                Query: queryRegex
+            ])
         }
     }
 
@@ -254,3 +277,4 @@ try {
         logLine("ERROR", "ExceptionStack", [Index: i, At: st.toString()])
     }
 }
+```
