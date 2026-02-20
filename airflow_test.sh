@@ -22,13 +22,17 @@ cat > /opt/airflow/dags/test_dag.py << 'EOF'
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
+import logging
+
+logger = logging.getLogger("airflow.task")
 
 def hello():
-    print("=== TEST LOG TO STDOUT ===")
+    logger.info("ALLOY_CHECK_INFO: test message")
+    logger.warning("ALLOY_CHECK_WARN: test message")
+    logger.error("ALLOY_CHECK_ERROR: test message")
 
 with DAG("test_dag", start_date=datetime(2024,1,1), schedule=None) as dag:
     PythonOperator(task_id="test_task", python_callable=hello)
 EOF
 
-# Теперь dag_id = test_dag, task_id = test_task
 airflow tasks test test_dag test_task 2024-01-01 --subdir /opt/airflow/dags/test_dag.py
