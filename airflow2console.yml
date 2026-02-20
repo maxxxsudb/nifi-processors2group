@@ -1,0 +1,19 @@
+localSettings:
+    stringOverride: |
+      import copy
+      from airflow.config_templates.airflow_local_settings import DEFAULT_LOGGING_CONFIG
+      LOGGING_CONFIG = copy.deepcopy(DEFAULT_LOGGING_CONFIG)
+      
+      # Task логи → stdout
+      LOGGING_CONFIG['handlers']['task'] = {
+          'class': 'logging.StreamHandler',
+          'formatter': 'airflow',
+          'stream': 'ext://sys.stdout',
+      }
+      
+      # DAG processor логи → stdout
+      LOGGING_CONFIG['handlers']['processor'] = {
+          'class': 'logging.StreamHandler',
+          'formatter': 'airflow',
+          'stream': 'ext://sys.stdout',
+      }
