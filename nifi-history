@@ -1,0 +1,483 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.transform.Field
+
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.time.Instant
+
+/* ================================================================
+   NiFi Processor HISTORY — Scripted ReportingTask (Groovy)
+
+   Маркер логов для Grafana:  [NIFI-HISTORY]
+   ================================================================ */
+
+// ---------- маркер ----------
+@Field String M = '[NIFI-HISTORY]'
+
+// ---------- кеши (живут между вызовами) ----------
+@Field Map tokenCache   = [token: null, expiresAt: 0L]
+@Field Map detailsCache = [:]
+@Field Map historyCache = [:]
+@Field SSLSocketFactory _trustSF = null
+@Field HostnameVerifier _trustHV = null
+
+// ======================== CONFIG ========================
+
+String cfg(String name, String fallback) {
+    try {
+        def entry = context.getProperties()?.find { k, v -> k.getName() == name }
+        def val = entry?.value?.toString()?.trim()
+        if (val) return val
+    } catch (ignored) {}
+    return fallback
+}
+
+boolean cfgBool(String name, boolean fb) {
+    cfg(name, fb.toString()).trim().equalsIgnoreCase('true')
+}
+
+int cfgInt(String name, int fb) {
+    try { Integer.parseInt(cfg(name, fb.toString()).trim()) } catch (e) { fb }
+}
+
+// ======================== TLS ========================
+
+void initTrustAll() {
+    if (_trustSF) return
+    def tm = [
+        getAcceptedIssuers: { -> new X509Certificate[0] },
+        checkClientTrusted: { c, t -> },
+        checkServerTrusted: { c, t -> }
+    ] as X509TrustManager
+    def sc = SSLContext.getInstance('TLS')
+    sc.init(null, [tm] as TrustManager[], new SecureRandom())
+    _trustSF = sc.getSocketFactory()
+    _trustHV = { h, s -> true } as HostnameVerifier
+}
+
+void applyTls(HttpURLConnection c, boolean trustAll) {
+    if (trustAll && c instanceof HttpsURLConnection) {
+        initTrustAll()
+        ((HttpsURLConnection) c).setSSLSocketFactory(_trustSF)
+        ((HttpsURLConnection) c).setHostnameVerifier(_trustHV)
+    }
+}
+
+// ======================== HTTP ========================
+
+String enc(String s) { URLEncoder.encode(s ?: '', 'UTF-8') }
+
+Map http(String method, String url, String bearer, String body,
+         Map<String,String> hdrs, boolean trustAll, int cto, int rto) {
+
+    HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection()
+    applyTls(c, trustAll)
+    c.requestMethod = method
+    c.connectTimeout = cto
+    c.readTimeout    = rto
+    c.setRequestProperty('Accept', 'application/json')
+    if (bearer) c.setRequestProperty('Authorization', "Bearer $bearer")
+    hdrs?.each { k, v -> c.setRequestProperty(k, v) }
+
+    if (body != null) {
+        c.doOutput = true
+        if (!hdrs?.containsKey('Content-Type'))
+            c.setRequestProperty('Content-Type', 'application/json')
+        c.outputStream.withWriter('UTF-8') { it << body }
+    }
+
+    int st = c.responseCode
+    String txt = ''
+    try { txt = (st in 200..299 ? c.inputStream : c.errorStream)?.getText('UTF-8') ?: '' }
+    catch (ignored) {}
+
+    def json = null
+    try { if (txt) json = new JsonSlurper().parseText(txt) } catch (ignored) {}
+    [status: st, body: txt, json: json]
+}
+
+Map httpGet(String url, String bearer, boolean ta, int cto, int rto) {
+    http('GET', url, bearer, null, null, ta, cto, rto)
+}
+
+Map httpPostForm(String url, Map<String,String> form, boolean ta, int cto, int rto) {
+    String body = form.collect { k, v -> "${enc(k)}=${enc(v)}" }.join('&')
+    http('POST', url, null, body, ['Content-Type':'application/x-www-form-urlencoded'], ta, cto, rto)
+}
+
+// ======================== KEYCLOAK ========================
+
+String obtainToken() {
+    long now = System.currentTimeMillis()
+    if (tokenCache.token && now < (tokenCache.expiresAt as long) - 30_000L) {
+        log.info("$M Токен из кеша (осталось ${((tokenCache.expiresAt as long) - now) / 1000}s)")
+        return tokenCache.token
+    }
+
+    String kcUrl    = cfg('KEYCLOAK_URL',          'https://mykeycloak').replaceAll('/+$', '')
+    String realm    = cfg('KEYCLOAK_REALM',         'pps')
+    String clientId = cfg('KEYCLOAK_CLIENT_ID',     '')
+    String secret   = cfg('KEYCLOAK_CLIENT_SECRET', '')
+    boolean ta = cfgBool('TRUST_ALL_TLS', false)
+    int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
+    int rto = cfgInt('READ_TIMEOUT_MS', 30000)
+
+    if (!clientId || !secret) {
+        log.error("$M KEYCLOAK_CLIENT_ID и KEYCLOAK_CLIENT_SECRET обязательны. " +
+                  "Задайте их как Dynamic Properties в ReportingTask.")
+        throw new RuntimeException("$M Missing Keycloak credentials")
+    }
+
+    String tokenUrl = "${kcUrl}/realms/${enc(realm)}/protocol/openid-connect/token"
+    log.info("$M Запрос токена: POST $tokenUrl  client_id=$clientId  scope=openid")
+
+    Map resp
+    try {
+        resp = httpPostForm(tokenUrl, [
+            grant_type   : 'client_credentials',
+            client_id    : clientId,
+            client_secret: secret,
+            scope        : 'openid'
+        ], ta, cto, rto)
+    } catch (Throwable t) {
+        log.error("$M Не удалось подключиться к Keycloak: $tokenUrl — ${t.class.simpleName}: ${t.message}")
+        log.error("$M Проверьте: 1) KEYCLOAK_URL корректен  2) сеть доступна  3) TRUST_ALL_TLS если self-signed")
+        throw t
+    }
+
+    // ---------- Диагностика ----------
+    if (resp.status == 401) {
+        String errDesc = resp.json?.error_description ?: resp.body
+        log.error("$M Keycloak 401 Unauthorized. Неверный client_id или client_secret.")
+        log.error("$M   client_id=$clientId")
+        log.error("$M   error_description=$errDesc")
+        throw new RuntimeException("$M Keycloak 401: $errDesc")
+    }
+    if (resp.status == 403) {
+        log.error("$M Keycloak 403 Forbidden. У клиента '$clientId' нет прав на client_credentials grant.")
+        log.error("$M   Проверьте: Keycloak → Clients → $clientId → Service accounts roles / Client authentication")
+        log.error("$M   Ответ: ${resp.body}")
+        throw new RuntimeException("$M Keycloak 403")
+    }
+    if (resp.status == 404) {
+        log.error("$M Keycloak 404. Realm '$realm' не найден или URL неверный.")
+        log.error("$M   Полный URL: $tokenUrl")
+        throw new RuntimeException("$M Keycloak 404: realm '$realm' not found")
+    }
+    if (resp.status == 400) {
+        String errDesc = resp.json?.error_description ?: resp.json?.error ?: resp.body
+        log.error("$M Keycloak 400 Bad Request: $errDesc")
+        log.error("$M   Возможные причины: неверный grant_type, клиент не поддерживает client_credentials, " +
+                  "scope 'openid' не разрешён")
+        throw new RuntimeException("$M Keycloak 400: $errDesc")
+    }
+    if (!(resp.status in 200..299)) {
+        log.error("$M Keycloak HTTP ${resp.status}. Ответ: ${resp.body}")
+        throw new RuntimeException("$M Keycloak unexpected HTTP ${resp.status}")
+    }
+
+    // ---------- Извлекаем токен ----------
+    String idToken     = resp.json?.id_token
+    String accessToken = resp.json?.access_token
+    long expiresIn     = (resp.json?.expires_in ?: 300) as long
+
+    String token
+    if (idToken) {
+        token = idToken
+        log.info("$M Получен id_token (expires_in=${expiresIn}s)")
+    } else if (accessToken) {
+        token = accessToken
+        log.warn("$M Keycloak НЕ вернул id_token, используем access_token!")
+        log.warn("$M   Возможные причины:")
+        log.warn("$M   1) В клиенте '$clientId' не включён scope 'openid'")
+        log.warn("$M   2) Keycloak не генерирует id_token для client_credentials")
+        log.warn("$M   Если NiFi ожидает именно id_token — проверьте настройки клиента в Keycloak")
+    } else {
+        log.error("$M Keycloak вернул 200, но нет ни id_token, ни access_token!")
+        log.error("$M   Ответ: ${resp.body}")
+        throw new RuntimeException("$M No token in Keycloak response")
+    }
+
+    tokenCache.token     = token
+    tokenCache.expiresAt = now + expiresIn * 1000L
+    return token
+}
+
+// ======================== CACHE HELPER ========================
+
+def cached(Map store, String key, long ttlMs, Closure loader) {
+    long now = System.currentTimeMillis()
+    def c = store[key]
+    if (c && now < (c.expiresAt as long)) return c.value
+    def val = loader()
+    store[key] = [expiresAt: now + ttlMs, value: val]
+    val
+}
+
+// ======================== NiFi: PROCESSOR DETAILS ========================
+
+Map loadDetails(String nifiUrl, String bearer, String pid, boolean ta, int cto, int rto) {
+    long ttl = cfgInt('DETAILS_CACHE_MIN', 5) * 60_000L
+    cached(detailsCache, pid, ttl) {
+        Map r = httpGet("$nifiUrl/nifi-api/processors/${enc(pid)}", bearer, ta, cto, rto)
+        if (r.status == 401 || r.status == 403) {
+            log.error("$M NiFi ${r.status} при запросе процессора $pid — токен не принят или нет прав")
+            log.error("$M   Ответ: ${r.body}")
+            log.error("$M   Проверьте: 1) токен валиден  2) в NiFi есть policy на чтение компонентов")
+            return [_authError: true]
+        }
+        if (!(r.status in 200..299)) {
+            log.warn("$M Процессор $pid: HTTP ${r.status}")
+            return [:]
+        }
+        r.json ?: [:]
+    }
+}
+
+// ======================== NiFi: HISTORY/AUDIT ========================
+
+boolean isCreateAction(Map a) {
+    String s = [a?.operation, a?.action].findAll().join(' ').toLowerCase()
+    s.contains('add') || s.contains('create')
+}
+
+Map summarizeHistory(List<Map> actions) {
+    if (!actions) return [
+        historyCount: 0,
+        createdBy: null, createdAt: null,
+        lastChangedBy: null, lastChangedAt: null, lastChangedOp: null
+    ]
+    Map oldest  = actions[0]
+    Map newest  = actions[-1]
+    Map created = actions.find { isCreateAction(it) } ?: oldest
+    [
+        historyCount : actions.size(),
+        createdBy    : created?.userIdentity,
+        createdAt    : created?.timestamp,
+        lastChangedBy: newest?.userIdentity,
+        lastChangedAt: newest?.timestamp,
+        lastChangedOp: newest?.operation
+    ]
+}
+
+Map loadHistory(String nifiUrl, String bearer, String cid, boolean ta, int cto, int rto) {
+    long ttl = cfgInt('HISTORY_CACHE_MIN', 30) * 60_000L
+    int pageSize = cfgInt('HISTORY_PAGE_SIZE', 100)
+    cached(historyCache, cid, ttl) {
+        String url = "$nifiUrl/nifi-api/flow/history" +
+                     "?sourceId=${enc(cid)}&offset=0&count=$pageSize" +
+                     "&sortColumn=timestamp&sortOrder=asc"
+        Map r = httpGet(url, bearer, ta, cto, rto)
+        List actions = []
+        if (r.status in 200..299) {
+            actions = (r.json?.history?.actions ?: []) as List
+        } else {
+            log.warn("$M History $cid: HTTP ${r.status}")
+        }
+        summarizeHistory(actions)
+    }
+}
+
+// ======================== RECURSIVE TRAVERSAL ========================
+
+void collectProcessors(String nifiUrl, String bearer, String gid, String path,
+                       Set<String> visited, List<Map> result, List<String> errors,
+                       boolean fetchHist, boolean ta, int cto, int rto) {
+    if (!visited.add(gid)) return
+
+    Map resp = httpGet("$nifiUrl/nifi-api/flow/process-groups/${enc(gid)}", bearer, ta, cto, rto)
+
+    if (resp.status == 401 || resp.status == 403) {
+        String msg = "NiFi ${resp.status} на группу $gid — токен не принят или нет прав. Ответ: ${resp.body}"
+        log.error("$M $msg")
+        log.error("$M Проверьте:")
+        log.error("$M   1) Токен (id_token) валиден и не истёк")
+        log.error("$M   2) Identity из токена имеет read-policy на /flow в NiFi")
+        log.error("$M   3) Identity mapping в nifi.properties корректен")
+        errors << msg
+        throw new RuntimeException("$M $msg")
+    }
+    if (!(resp.status in 200..299)) {
+        String msg = "Группа $gid ($path): HTTP ${resp.status}"
+        log.warn("$M $msg")
+        errors << msg
+        return
+    }
+
+    Map flow = resp.json?.processGroupFlow?.flow ?: [:]
+
+    // --- Процессоры ---
+    (flow.processors ?: []).each { Map pe ->
+        try {
+            Map comp = pe?.component ?: [:]
+            String pid = comp?.id?.toString()
+            if (!pid) return
+
+            Map snap = pe?.status?.aggregateSnapshot ?: pe?.status ?: [:]
+
+            // Детали процессора
+            Map det = loadDetails(nifiUrl, bearer, pid, ta, cto, rto)
+            if (det?._authError) {
+                errors << "Auth error при загрузке процессора $pid (${comp.name})"
+                return
+            }
+            Map dc   = det?.component ?: [:]
+            Map dcfg = dc?.config ?: [:]
+            Map ds   = det?.status?.aggregateSnapshot ?: det?.status ?: [:]
+
+            // История
+            Map hist = fetchHist
+                ? loadHistory(nifiUrl, bearer, pid, ta, cto, rto)
+                : [historyCount: 0]
+
+            result << [
+                // --- Идентификация ---
+                id               : pid,
+                name             : comp.name,
+                type             : comp.type,
+                bundle           : comp.bundle ? "${comp.bundle.group}:${comp.bundle.artifact}:${comp.bundle.version}" : null,
+                groupPath        : path,
+                parentGroupId    : comp.parentGroupId,
+
+                // --- Состояние ---
+                state            : dc.state ?: comp.state,
+                runStatus        : snap.runStatus ?: ds.runStatus ?: dc.state,
+                validationStatus : dc.validationStatus,
+                validationErrors : dc.validationErrors ?: [],
+
+                // --- Конфигурация ---
+                schedulingStrategy: dcfg.schedulingStrategy ?: dc.schedulingStrategy,
+                schedulingPeriod  : dcfg.schedulingPeriod ?: dc.schedulingPeriod,
+                concurrentTasks   : dcfg.concurrentlySchedulableTaskCount,
+                executionNode     : dcfg.executionNode,
+                penaltyDuration   : dcfg.penaltyDuration,
+                yieldDuration     : dcfg.yieldDuration,
+                bulletinLevel     : dcfg.bulletinLevel,
+                comments          : dc.comments,
+
+                // --- Runtime метрики ---
+                activeThreads     : snap.activeThreadCount ?: ds.activeThreadCount ?: 0,
+                flowFilesIn       : snap.flowFilesIn ?: snap.inputCount,
+                bytesIn           : snap.bytesIn ?: snap.inputBytes,
+                flowFilesOut      : snap.flowFilesOut ?: snap.outputCount,
+                bytesOut          : snap.bytesOut ?: snap.outputBytes,
+                bytesRead         : snap.bytesRead,
+                bytesWritten      : snap.bytesWritten,
+                taskCount         : snap.taskCount,
+                tasksDurationNanos: snap.tasksDurationNanos,
+
+                // --- Ревизия ---
+                revisionVersion  : det?.revision?.version,
+                revisionModifier : det?.revision?.lastModifier,
+
+                // --- Аудит: кто создал ---
+                createdBy        : hist.createdBy,
+                createdAt        : hist.createdAt,
+
+                // --- Аудит: кто последний менял ---
+                lastChangedBy    : hist.lastChangedBy ?: det?.revision?.lastModifier,
+                lastChangedAt    : hist.lastChangedAt,
+                lastChangedOp    : hist.lastChangedOp,
+                historyCount     : hist.historyCount ?: 0
+            ]
+        } catch (Throwable t) {
+            String msg = "Процессор ${pe?.component?.name} (${pe?.component?.id}): ${t.message}"
+            log.warn("$M Пропускаю: $msg")
+            errors << msg
+        }
+    }
+
+    // --- Дочерние группы ---
+    (flow.processGroups ?: []).each { Map cg ->
+        String cgId   = cg?.component?.id?.toString()
+        String cgName = cg?.component?.name?.toString() ?: cgId
+        if (!cgId) return
+        String childPath = path == '/' ? "/$cgName" : "$path/$cgName"
+        collectProcessors(nifiUrl, bearer, cgId, childPath, visited, result, errors,
+                          fetchHist, ta, cto, rto)
+    }
+}
+
+// ======================== MAIN ========================
+
+try {
+    log.info("$M ==================== СТАРТ ====================")
+
+    String nifiUrl    = cfg('NIFI_URL',    'https://svc.nifi').replaceAll('/+$', '')
+    String outputFile = cfg('OUTPUT_FILE', '/tmp/nifi-inventory.json')
+    boolean ta        = cfgBool('TRUST_ALL_TLS',   false)
+    boolean fetchHist = cfgBool('FETCH_HISTORY',   true)
+    boolean logJson   = cfgBool('LOG_REPORT_JSON', false)
+    int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
+    int rto = cfgInt('READ_TIMEOUT_MS',    30000)
+
+    // 1) Токен
+    log.info("$M Получение id_token из Keycloak...")
+    String bearer = obtainToken()
+
+    // 2) Сбор
+    log.info("$M Обход процессоров: $nifiUrl")
+    List<Map> processors = []
+    List<String> errors  = []
+    Set<String> visited  = new LinkedHashSet<>()
+
+    collectProcessors(nifiUrl, bearer, 'root', '/', visited, processors, errors,
+                      fetchHist, ta, cto, rto)
+
+    processors.sort { a, b ->
+        int c = (a.groupPath ?: '') <=> (b.groupPath ?: '')
+        c != 0 ? c : ((a.name ?: '') <=> (b.name ?: ''))
+    }
+
+    // 3) Отчёт
+    Map report = [
+        generatedAt    : Instant.now().toString(),
+        nifiUrl        : nifiUrl,
+        totalProcessors: processors.size(),
+        errorsCount    : errors.size(),
+        errors         : errors,
+        processors     : processors
+    ]
+
+    String json = JsonOutput.prettyPrint(JsonOutput.toJson(report))
+
+    // 4) Вывод
+    if (outputFile) {
+        new File(outputFile).with { f ->
+            f.parentFile?.mkdirs()
+            f.setText(json, 'UTF-8')
+        }
+        log.info("$M Файл: $outputFile (${json.length()} bytes)")
+    }
+    if (logJson) {
+        log.info("$M JSON_REPORT_BEGIN")
+        log.info(json)
+        log.info("$M JSON_REPORT_END")
+    }
+
+    // 5) Сводка
+    Map<String,Integer> byState = processors.countBy { (it.state ?: 'UNKNOWN').toString() }
+    String stateLine = byState.collect { k, v -> "$k=$v" }.join('  ')
+
+    log.info("$M -------------------- ИТОГО --------------------")
+    log.info("$M Процессоров:     ${processors.size()}")
+    log.info("$M По состояниям:   $stateLine")
+    log.info("$M Групп обойдено:  ${visited.size()}")
+    log.info("$M Ошибок:          ${errors.size()}")
+    if (errors) {
+        errors.each { e -> log.warn("$M   ⚠ $e") }
+    }
+    log.info("$M ==================== ГОТОВО ====================")
+
+} catch (Throwable t) {
+    log.error("$M FATAL: ${t.message}", t)
+    throw t
+}
