@@ -1,5 +1,4 @@
-
-// GENERATED AT: 2026-03-30 14:49 CEST
+// GENERATED AT: 2026-03-30 18:12 CEST
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.Field
@@ -208,7 +207,7 @@ String obtainToken() {
 try {
     System.out.println("$M ==================== СТАРТ ====================")
 
-    String nifiUrl    = cfg('NIFI_URL',    '[https://svc.nifi](https://svc.nifi)').replaceAll('/+$', '')
+    String nifiUrl    = cfg('NIFI_URL',    'https://svc.nifi').replaceAll('/+$', '')
     String outputFileRaw = cfg('OUTPUT_FILE', '/tmp/nifi-history.json')
     
     // Формируем имя файла для отфильтрованных данных
@@ -334,31 +333,34 @@ try {
         // Сохраняем всё в сырой дамп
         allRawActions.addAll(actions)
 
-        for (Map action : actions) {
-            long actTs = parseNifiTime(action.timestamp?.toString())
+        for (Map actionEntity : actions) {
+            long actTs = parseNifiTime(actionEntity.timestamp?.toString())
 
             if (thresholdMs > 0 && actTs > 0 && actTs < thresholdMs) {
                 keepFetching = false
                 break
             }
 
-            String tableType1 = action['type']?.toString() ?: ''
-            String tableType2 = action['componentDetails'] instanceof Map ? action['componentDetails']['type']?.toString() ?: '' : ''
-            String tableType3 = action['actionDetails'] instanceof Map ? action['actionDetails']['type']?.toString() ?: '' : ''
+            // ИЗВЛЕКАЕМ ВЛОЖЕННЫЙ ОБЪЕКТ ACTION
+            Map innerAction = actionEntity['action'] instanceof Map ? (Map) actionEntity['action'] : [:]
+
+            String tableType1 = innerAction['sourceType']?.toString() ?: ''
+            String tableType2 = innerAction['componentDetails'] instanceof Map ? innerAction['componentDetails']['type']?.toString() ?: '' : ''
+            String tableType3 = innerAction['actionDetails'] instanceof Map ? innerAction['actionDetails']['type']?.toString() ?: '' : ''
 
             typeTableRows << [
-                id                    : action['id'],
-                timestamp             : action['timestamp'],
-                userIdentity          : action['userIdentity'],
-                actionType            : tableType1,
-                componentDetailsType  : tableType2,
-                actionDetailsType     : tableType3
+                id                  : actionEntity['id'],
+                timestamp           : actionEntity['timestamp'],
+                userIdentity        : innerAction['userIdentity'],
+                actionType          : tableType1,
+                componentDetailsType: tableType2,
+                actionDetailsType   : tableType3
             ]
 
             [
-                'action.type'                   : tableType1,
-                'componentDetails.type'         : tableType2,
-                'actionDetails.type'            : tableType3
+                'action.type'          : tableType1,
+                'componentDetails.type': tableType2,
+                'actionDetails.type'   : tableType3
             ].each { k, v ->
                 String key = "${k} = ${v ?: '<EMPTY>'}"
                 typeTableCounts[key] = (typeTableCounts[key] ?: 0) + 1
@@ -366,18 +368,16 @@ try {
 
             boolean match = true
 
-            // Фильтр по пользователю
-            if (filterUser && action['userIdentity'] != filterUser) {
+            // Фильтр по пользователю (используем данные из внутреннего объекта)
+            if (filterUser && innerAction['userIdentity'] != filterUser) {
                 match = false
             }
 
             // Фильтр по типу (ищем в componentDetails и actionDetails)
             if (match && filterType) {
-                String t1 = action['componentDetails'] instanceof Map ? action['componentDetails']['type']?.toString() ?: '' : ''
-                String t2 = action['actionDetails'] instanceof Map ? action['actionDetails']['type']?.toString() ?: '' : ''
                 String f = filterType.toLowerCase()
 
-                boolean typeMatch = [t1, t2].any { t ->
+                boolean typeMatch = [tableType2, tableType3].any { t ->
                     t && (t.toLowerCase() == f || t.toLowerCase().endsWith("." + f))
                 }
 
@@ -387,9 +387,9 @@ try {
             }
 
             if (match) {
-                String actionId = action['id']?.toString()
+                String actionId = actionEntity['id']?.toString()
                 if (!actionId || seenIds.add(actionId)) {
-                    filteredRecords << action
+                    filteredRecords << actionEntity
                 }
             }
         }
