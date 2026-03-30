@@ -1,4 +1,5 @@
-// GENERATED AT: 2026-03-30 14:49 CEST
+```groovy
+// GENERATED AT: 2026-03-30 17:12 CEST
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.Field
@@ -218,6 +219,13 @@ try {
         outputFileFiltered = outputFileRaw + '_filtered.json'
     }
 
+    String outputFileTable = outputFileRaw
+    if (outputFileRaw.endsWith('.json')) {
+        outputFileTable = outputFileRaw.replace('.json', '_table.json')
+    } else {
+        outputFileTable = outputFileRaw + '_table.json'
+    }
+
     boolean ta        = cfgBool('TRUST_ALL_TLS',   false)
     int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
     int rto = cfgInt('READ_TIMEOUT_MS',    30000)
@@ -274,6 +282,8 @@ try {
     List<Map> filteredRecords = []
     List<String> errors = []
     Set<String> seenIds = new HashSet<>()
+    List<Map> typeTableRows = []
+    Map<String, Integer> typeTableCounts = new LinkedHashMap<>()
 
     while (keepFetching && pageNum < maxPages) {
         pageNum++
@@ -330,6 +340,28 @@ try {
             if (thresholdMs > 0 && actTs > 0 && actTs < thresholdMs) {
                 keepFetching = false
                 break
+            }
+
+            String tableType1 = action.type?.toString() ?: ''
+            String tableType2 = action.componentDetails?.type?.toString() ?: ''
+            String tableType3 = action.actionDetails?.type?.toString() ?: ''
+
+            typeTableRows << [
+                id                    : action.id,
+                timestamp             : action.timestamp,
+                userIdentity          : action.userIdentity,
+                actionType            : tableType1,
+                componentDetailsType  : tableType2,
+                actionDetailsType     : tableType3
+            ]
+
+            [
+                'action.type'                   : tableType1,
+                'componentDetails.type'         : tableType2,
+                'actionDetails.type'            : tableType3
+            ].each { k, v ->
+                String key = "${k} = ${v ?: '<EMPTY>'}"
+                typeTableCounts[key] = (typeTableCounts[key] ?: 0) + 1
             }
 
             boolean match = true
@@ -394,6 +426,30 @@ try {
     System.out.println("$M [RAW] Сохранен полный сырой дамп: $outputFileRaw (${allRawActions.size()} записей)")
 
     // ---------------------------------------------------------
+    // ЗАПИСЬ ТАБЛИЦЫ ПО ТИПАМ
+    // ---------------------------------------------------------
+    List<Map> typeSummary = typeTableCounts.collect { k, v ->
+        [value: k, count: v]
+    }.sort { a, b ->
+        (b.count as int) <=> (a.count as int)
+    }
+
+    Map tableReport = [
+        generatedAt   : Instant.now().toString(),
+        nifiUrl       : nifiUrl,
+        filterType    : filterType,
+        totalActions  : typeTableRows.size(),
+        summary       : typeSummary,
+        rows          : typeTableRows
+    ]
+
+    new File(outputFileTable).with { f ->
+        f.parentFile?.mkdirs()
+        f.setText(JsonOutput.prettyPrint(JsonOutput.toJson(tableReport)), 'UTF-8')
+    }
+    System.out.println("$M [TABLE] Сохранена таблица типов: $outputFileTable (${typeTableRows.size()} строк)")
+
+    // ---------------------------------------------------------
     // ЗАПИСЬ ОТФИЛЬТРОВАННОГО ФАЙЛА
     // ---------------------------------------------------------
     boolean isPartial = limitReached || !errors.isEmpty()
@@ -431,3 +487,4 @@ try {
 } catch (Throwable t) {
     System.err.println("$M [КРИТИЧЕСКАЯ ОШИБКА] Скрипт упал с исключениями. Описание: ${t.message}")
 }
+```
