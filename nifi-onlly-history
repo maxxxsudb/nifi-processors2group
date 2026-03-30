@@ -1,5 +1,5 @@
-```groovy
-// GENERATED AT: 2026-03-30 17:12 CEST
+
+// GENERATED AT: 2026-03-30 14:49 CEST
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.Field
@@ -342,14 +342,14 @@ try {
                 break
             }
 
-            String tableType1 = action.type?.toString() ?: ''
-            String tableType2 = action.componentDetails?.type?.toString() ?: ''
-            String tableType3 = action.actionDetails?.type?.toString() ?: ''
+            String tableType1 = action['type']?.toString() ?: ''
+            String tableType2 = action['componentDetails'] instanceof Map ? action['componentDetails']['type']?.toString() ?: '' : ''
+            String tableType3 = action['actionDetails'] instanceof Map ? action['actionDetails']['type']?.toString() ?: '' : ''
 
             typeTableRows << [
-                id                    : action.id,
-                timestamp             : action.timestamp,
-                userIdentity          : action.userIdentity,
+                id                    : action['id'],
+                timestamp             : action['timestamp'],
+                userIdentity          : action['userIdentity'],
                 actionType            : tableType1,
                 componentDetailsType  : tableType2,
                 actionDetailsType     : tableType3
@@ -367,14 +367,14 @@ try {
             boolean match = true
 
             // Фильтр по пользователю
-            if (filterUser && action.userIdentity != filterUser) {
+            if (filterUser && action['userIdentity'] != filterUser) {
                 match = false
             }
 
             // Фильтр по типу (ищем в componentDetails и actionDetails)
             if (match && filterType) {
-                String t1 = action.componentDetails?.type?.toString() ?: ''
-                String t2 = action.actionDetails?.type?.toString() ?: ''
+                String t1 = action['componentDetails'] instanceof Map ? action['componentDetails']['type']?.toString() ?: '' : ''
+                String t2 = action['actionDetails'] instanceof Map ? action['actionDetails']['type']?.toString() ?: '' : ''
                 String f = filterType.toLowerCase()
 
                 boolean typeMatch = [t1, t2].any { t ->
@@ -387,7 +387,7 @@ try {
             }
 
             if (match) {
-                String actionId = action.id?.toString()
+                String actionId = action['id']?.toString()
                 if (!actionId || seenIds.add(actionId)) {
                     filteredRecords << action
                 }
@@ -487,4 +487,3 @@ try {
 } catch (Throwable t) {
     System.err.println("$M [КРИТИЧЕСКАЯ ОШИБКА] Скрипт упал с исключениями. Описание: ${t.message}")
 }
-```
