@@ -1,0 +1,431 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.transform.Field
+
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.time.Instant
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+/* ================================================================
+   NiFi Processor HISTORY — Scripted ReportingTask (Groovy)
+
+   Маркер логов для Grafana:  [NIFI-HISTORY]
+   ================================================================ */
+
+// ---------- маркер ----------
+@Field String M = '[NIFI-HISTORY]'
+
+// ---------- кеши (живут между вызовами) ----------
+@Field Map tokenCache   = [token: null, expiresAt: 0L]
+@Field SSLSocketFactory _trustSF = null
+@Field HostnameVerifier _trustHV = null
+
+// ======================== CONFIG ========================
+
+String cfg(String name, String fallback) {
+    try {
+        def entry = context.getProperties()?.find { k, v -> k.getName() == name }
+        def val = entry?.value?.toString()?.trim()
+        if (val) return val
+    } catch (ignored) {}
+    return fallback
+}
+
+boolean cfgBool(String name, boolean fb) {
+    cfg(name, fb.toString()).trim().equalsIgnoreCase('true')
+}
+
+int cfgInt(String name, int fb) {
+    try { Integer.parseInt(cfg(name, fb.toString()).trim()) } catch (e) { fb }
+}
+
+// ======================== HELPER: TIME PARSER ========================
+
+long parseNifiTime(String ts) {
+    if (!ts) return 0L
+    try { return Instant.parse(ts).toEpochMilli() } catch (ignored) {}
+    try { return java.time.ZonedDateTime.parse(ts).toInstant().toEpochMilli() } catch (ignored) {}
+    try {
+        SimpleDateFormat sdf = new SimpleDateFormat("MM/dd/yyyy HH:mm:ss z", Locale.US)
+        sdf.setLenient(false)
+        sdf.setTimeZone(TimeZone.getTimeZone("UTC"))
+        return sdf.parse(ts).getTime()
+    } catch (ignored) {}
+    try {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        sdf.setLenient(false)
+        sdf.setTimeZone(TimeZone.getTimeZone("UTC"))
+        return sdf.parse(ts).getTime()
+    } catch (ignored) {}
+    return 0L
+}
+
+// ======================== TLS ========================
+
+void initTrustAll() {
+    if (_trustSF) return
+    def tm = [
+        getAcceptedIssuers: { -> new X509Certificate[0] },
+        checkClientTrusted: { c, t -> },
+        checkServerTrusted: { c, t -> }
+    ] as X509TrustManager
+    def sc = SSLContext.getInstance('TLS')
+    sc.init(null, [tm] as TrustManager[], new SecureRandom())
+    _trustSF = sc.getSocketFactory()
+    _trustHV = { h, s -> true } as HostnameVerifier
+}
+
+void applyTls(HttpURLConnection c, boolean trustAll) {
+    if (trustAll && c instanceof HttpsURLConnection) {
+        initTrustAll()
+        ((HttpsURLConnection) c).setSSLSocketFactory(_trustSF)
+        ((HttpsURLConnection) c).setHostnameVerifier(_trustHV)
+    }
+}
+
+// ======================== HTTP ========================
+
+String enc(String s) { URLEncoder.encode(s ?: '', 'UTF-8') }
+
+Map http(String method, String url, String bearer, String body,
+         Map<String,String> hdrs, boolean trustAll, int cto, int rto) {
+
+    HttpURLConnection c = null
+    try {
+        c = (HttpURLConnection) new URL(url).openConnection()
+        applyTls(c, trustAll)
+        c.requestMethod = method
+        c.connectTimeout = cto
+        c.readTimeout    = rto
+        c.setRequestProperty('Accept', 'application/json')
+        if (bearer) c.setRequestProperty('Authorization', "Bearer $bearer")
+        hdrs?.each { k, v -> c.setRequestProperty(k, v) }
+
+        if (body != null) {
+            c.doOutput = true
+            if (!hdrs?.containsKey('Content-Type'))
+                c.setRequestProperty('Content-Type', 'application/json')
+            c.outputStream.withWriter('UTF-8') { it << body }
+        }
+
+        int st = c.responseCode
+        String txt = ''
+        try { txt = (st in 200..299 ? c.inputStream : c.errorStream)?.getText('UTF-8') ?: '' }
+        catch (ignored) {}
+
+        def json = null
+        try { if (txt) json = new JsonSlurper().parseText(txt) } catch (ignored) {}
+        
+        return [status: st, body: txt, json: json]
+    } finally {
+        if (c != null) {
+            try { c.disconnect() } catch (ignored) {}
+        }
+    }
+}
+
+Map httpGet(String url, String bearer, boolean ta, int cto, int rto) {
+    http('GET', url, bearer, null, null, ta, cto, rto)
+}
+
+Map httpPostForm(String url, Map<String,String> form, boolean ta, int cto, int rto) {
+    String body = form.collect { k, v -> "${enc(k)}=${enc(v)}" }.join('&')
+    http('POST', url, null, body, ['Content-Type':'application/x-www-form-urlencoded'], ta, cto, rto)
+}
+
+// ======================== KEYCLOAK ========================
+// АВТОРИЗАЦИЯ НЕ ТРОНУТА
+
+String obtainToken() {
+    long now = System.currentTimeMillis()
+    if (tokenCache.token && now < (tokenCache.expiresAt as long) - 30_000L) {
+        log.info("$M Токен из кеша (осталось ${((tokenCache.expiresAt as long) - now) / 1000}s)")
+        return tokenCache.token
+    }
+
+    String kcUrl    = cfg('KEYCLOAK_URL',          'https://mykeycloak').replaceAll('/+$', '')
+    String realm    = cfg('KEYCLOAK_REALM',         'pps')
+    String clientId = cfg('KEYCLOAK_CLIENT_ID',     '')
+    String secret   = cfg('KEYCLOAK_CLIENT_SECRET', '')
+    boolean ta = cfgBool('TRUST_ALL_TLS', false)
+    int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
+    int rto = cfgInt('READ_TIMEOUT_MS', 30000)
+
+    if (!clientId || !secret) {
+        log.error("$M KEYCLOAK_CLIENT_ID и KEYCLOAK_CLIENT_SECRET обязательны.")
+        throw new RuntimeException("$M Missing Keycloak credentials")
+    }
+
+    String tokenUrl = "${kcUrl}/realms/${enc(realm)}/protocol/openid-connect/token"
+    log.info("$M Запрос токена: POST $tokenUrl  client_id=$clientId  scope=openid")
+
+    Map resp
+    try {
+        resp = httpPostForm(tokenUrl, [
+            grant_type   : 'client_credentials',
+            client_id    : clientId,
+            client_secret: secret,
+            scope        : 'openid'
+        ], ta, cto, rto)
+    } catch (Throwable t) {
+        log.error("$M Не удалось подключиться к Keycloak: $tokenUrl — ${t.class.simpleName}: ${t.message}")
+        throw t
+    }
+
+    if (resp.status == 401) {
+        String errDesc = resp.json?.error_description ?: resp.body
+        log.error("$M Keycloak 401 Unauthorized. Неверный client_id или client_secret.")
+        throw new RuntimeException("$M Keycloak 401: $errDesc")
+    }
+    if (resp.status == 403) {
+        log.error("$M Keycloak 403 Forbidden.")
+        throw new RuntimeException("$M Keycloak 403")
+    }
+    if (resp.status == 404) {
+        log.error("$M Keycloak 404. Realm '$realm' не найден.")
+        throw new RuntimeException("$M Keycloak 404: realm '$realm' not found")
+    }
+    if (resp.status == 400) {
+        String errDesc = resp.json?.error_description ?: resp.json?.error ?: resp.body
+        log.error("$M Keycloak 400 Bad Request: $errDesc")
+        throw new RuntimeException("$M Keycloak 400: $errDesc")
+    }
+    if (!(resp.status in 200..299)) {
+        log.error("$M Keycloak HTTP ${resp.status}. Ответ: ${resp.body}")
+        throw new RuntimeException("$M Keycloak unexpected HTTP ${resp.status}")
+    }
+
+    String idToken     = resp.json?.id_token
+    String accessToken = resp.json?.access_token
+    long expiresIn     = (resp.json?.expires_in ?: 300) as long
+
+    String token
+    if (idToken) {
+        token = idToken
+        log.info("$M Получен id_token (expires_in=${expiresIn}s)")
+    } else if (accessToken) {
+        token = accessToken
+        log.warn("$M Keycloak НЕ вернул id_token, используем access_token!")
+    } else {
+        log.error("$M Keycloak вернул 200, но нет ни id_token, ни access_token!")
+        throw new RuntimeException("$M No token in Keycloak response")
+    }
+
+    tokenCache.token     = token
+    tokenCache.expiresAt = now + expiresIn * 1000L
+    return token
+}
+
+// ======================== MAIN ========================
+
+try {
+    log.info("$M ==================== СТАРТ ====================")
+
+    String nifiUrl    = cfg('NIFI_URL',    'https://svc.nifi').replaceAll('/+$', '')
+    String outputFile = cfg('OUTPUT_FILE', '/tmp/nifi-history.json')
+    boolean ta        = cfgBool('TRUST_ALL_TLS',   false)
+    boolean logJson   = cfgBool('LOG_REPORT_JSON', false)
+    int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
+    int rto = cfgInt('READ_TIMEOUT_MS',    30000)
+
+    // --- Параметры фильтрации ---
+    String filterType         = cfg('FILTER_PROCESSOR_TYPE', '')
+    String filterUser         = cfg('FILTER_USER_IDENTITY', '')
+    int filterMinutes         = cfgInt('FILTER_MINUTES_AGO', 0)
+    String filterTimestampStr = cfg('FILTER_TIMESTAMP_START', '')
+    
+    int pageSize = cfgInt('HISTORY_PAGE_SIZE', 1000)
+    int maxPages = cfgInt('MAX_PAGES', 1000)
+
+    if (pageSize <= 0) throw new RuntimeException("$M HISTORY_PAGE_SIZE должно быть > 0")
+    if (maxPages <= 0) throw new RuntimeException("$M MAX_PAGES должно быть > 0")
+
+    if (filterMinutes > 0 && filterTimestampStr) {
+        log.warn("$M ВНИМАНИЕ: Заданы оба фильтра времени. Используется FILTER_MINUTES_AGO, FILTER_TIMESTAMP_START игнорируется.")
+    }
+
+    // Вычисляем Timestamp отсечки
+    long thresholdMs = 0L
+    if (filterMinutes > 0) {
+        thresholdMs = System.currentTimeMillis() - (filterMinutes * 60_000L)
+        log.info("$M Фильтр по времени: изменения за последние $filterMinutes мин.")
+    } else if (filterTimestampStr) {
+        thresholdMs = parseNifiTime(filterTimestampStr)
+        if (thresholdMs == 0L) {
+            throw new RuntimeException("$M ОШИБКА: Неверный формат FILTER_TIMESTAMP_START: '$filterTimestampStr'")
+        }
+        log.info("$M Фильтр по времени: начиная с $filterTimestampStr ($thresholdMs)")
+    }
+
+    if (filterType) log.info("$M Фильтр по типу: $filterType")
+    if (filterUser) log.info("$M Фильтр по пользователю: $filterUser")
+
+    // 1) Токен
+    String bearer = obtainToken()
+
+    // 2) Вытаскиваем историю
+    log.info("$M Запрос глобальной истории NiFi...")
+    
+    int offset = 0
+    int pageNum = 0
+    boolean keepFetching = true
+
+    List<Map> filteredActions = []
+    List<String> errors = []
+    Set<String> seenIds = new HashSet<>()
+
+    while (keepFetching && pageNum < maxPages) {
+        pageNum++
+        
+        String url = "$nifiUrl/nifi-api/flow/history?offset=$offset&count=$pageSize&sortColumn=timestamp&sortOrder=desc"
+        if (thresholdMs > 0) {
+            SimpleDateFormat sdf = new SimpleDateFormat("MM/dd/yyyy HH:mm:ss z", Locale.US)
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"))
+            String sd = sdf.format(new Date(thresholdMs))
+            url += "&startDate=${enc(sd)}"
+        }
+
+        Map r = httpGet(url, bearer, ta, cto, rto)
+        
+        if (r.status == 401 || r.status == 403) {
+            String msg = "NiFi ${r.status} при запросе истории. Проверьте права токена."
+            log.error("$M $msg")
+            errors << msg
+            break
+        }
+        if (!(r.status in 200..299)) {
+            String msg = "История NiFi недоступна: HTTP ${r.status}. Ответ: ${r.body}"
+            log.warn("$M $msg")
+            errors << msg
+            break
+        }
+        if (!(r.json instanceof Map) || !(r.json.history?.actions instanceof List)) {
+            String msg = "NiFi вернул 200, но структура ответа не содержит ожидаемый history.actions. Проверьте URL."
+            log.error("$M $msg")
+            errors << msg
+            break
+        }
+
+        int total = (r.json.history.total ?: 0) as int
+        List actions = r.json.history.actions as List
+        
+        if (actions.isEmpty()) {
+            break 
+        }
+
+        for (Map action : actions) {
+            long actTs = parseNifiTime(action.timestamp?.toString())
+
+            if (thresholdMs > 0 && actTs > 0 && actTs < thresholdMs) {
+                keepFetching = false
+                break
+            }
+
+            boolean match = true
+
+            // Фильтр по пользователю
+            if (filterUser && action.userIdentity != filterUser) {
+                match = false
+            }
+
+            // Фильтр по типу процессора (точное совпадение или суффикс)
+            if (match && filterType) {
+                String sType = action.sourceType?.toString() ?: ''
+                String t1 = action.componentDetails?.type?.toString() ?: ''
+                String t2 = action.actionDetails?.type?.toString() ?: ''
+                String f = filterType.toLowerCase()
+
+                boolean typeMatch = [t1, t2].any { t ->
+                    t && (t.toLowerCase() == f || t.toLowerCase().endsWith("." + f))
+                }
+
+                if (sType != 'Processor' || !typeMatch) {
+                    match = false
+                }
+            }
+
+            // Дедупликация (пропускаем пустые ID без ошибки)
+            if (match) {
+                String actionId = action.id?.toString()
+                if (!actionId || seenIds.add(actionId)) {
+                    filteredActions << action
+                }
+            }
+        }
+        
+        if (offset + actions.size() >= total) {
+            keepFetching = false
+        }
+
+        if (keepFetching) {
+            offset += actions.size() // Умный сдвиг на размер полученного, а не запрашиваемого
+            if (pageNum % 10 == 0) {
+                log.info("$M Обработано страниц: $pageNum, смещение: $offset ...")
+            }
+        }
+    }
+
+    // Проверяем, не уперлись ли мы в лимит
+    boolean limitReached = (pageNum >= maxPages && keepFetching)
+    if (limitReached) {
+        String msg = "Достигнут лимит страниц ($maxPages). Выгрузка остановлена досрочно."
+        log.warn("$M $msg")
+        errors << msg
+    }
+
+    boolean isPartial = limitReached || !errors.isEmpty()
+
+    // 3) Формируем отчет
+    Map report = [
+        generatedAt   : Instant.now().toString(),
+        nifiUrl       : nifiUrl,
+        partialReport : isPartial,
+        totalActions  : filteredActions.size(),
+        errorsCount   : errors.size(),
+        errors        : errors,
+        actions       : filteredActions
+    ]
+
+    String json = JsonOutput.prettyPrint(JsonOutput.toJson(report))
+
+    // 4) Вывод (Размер файла не контролируется)
+    if (outputFile) {
+        new File(outputFile).with { f ->
+            f.parentFile?.mkdirs()
+            f.setText(json, 'UTF-8')
+        }
+        log.info("$M Файл: $outputFile (${json.length()} bytes)")
+    }
+    if (logJson) {
+        log.info("$M JSON_REPORT_BEGIN")
+        log.info(json)
+        log.info("$M JSON_REPORT_END")
+    }
+
+    log.info("$M -------------------- ИТОГО --------------------")
+    log.info("$M Событий найдено: ${filteredActions.size()}")
+    log.info("$M Страниц скачано: $pageNum")
+    log.info("$M Ошибок/Ворнингов: ${errors.size()}")
+    if (isPartial) {
+        log.warn("$M ВНИМАНИЕ: Отчет сформирован частично (partialReport=true)!")
+    }
+    if (errors) {
+        errors.each { e -> log.warn("$M   ⚠ $e") }
+    }
+    log.info("$M ==================== ГОТОВО ====================")
+
+} catch (Throwable t) {
+    log.error("$M FATAL: ${t.message}", t)
+    throw t
+}
