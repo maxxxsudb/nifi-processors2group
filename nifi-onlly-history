@@ -23,7 +23,6 @@ import java.util.TimeZone
    Маркер логов для Grafana:  [NIFI-HISTORY]
    ================================================================ */
 
-// ---------- маркер ----------
 @Field String M = '[NIFI-HISTORY]'
 
 // ---------- кеши (живут между вызовами) ----------
@@ -185,25 +184,20 @@ String obtainToken() {
 
     if (resp.status == 401) {
         String errDesc = resp.json?.error_description ?: resp.body
-        log.error("$M Keycloak 401 Unauthorized. Неверный client_id или client_secret.")
-        throw new RuntimeException("$M Keycloak 401: $errDesc")
+        throw new RuntimeException("$M Keycloak 401 Unauthorized: $errDesc")
     }
     if (resp.status == 403) {
-        log.error("$M Keycloak 403 Forbidden.")
-        throw new RuntimeException("$M Keycloak 403")
+        throw new RuntimeException("$M Keycloak 403 Forbidden")
     }
     if (resp.status == 404) {
-        log.error("$M Keycloak 404. Realm '$realm' не найден.")
         throw new RuntimeException("$M Keycloak 404: realm '$realm' not found")
     }
     if (resp.status == 400) {
         String errDesc = resp.json?.error_description ?: resp.json?.error ?: resp.body
-        log.error("$M Keycloak 400 Bad Request: $errDesc")
-        throw new RuntimeException("$M Keycloak 400: $errDesc")
+        throw new RuntimeException("$M Keycloak 400 Bad Request: $errDesc")
     }
     if (!(resp.status in 200..299)) {
-        log.error("$M Keycloak HTTP ${resp.status}. Ответ: ${resp.body}")
-        throw new RuntimeException("$M Keycloak unexpected HTTP ${resp.status}")
+        throw new RuntimeException("$M Keycloak unexpected HTTP ${resp.status}: ${resp.body}")
     }
 
     String idToken     = resp.json?.id_token
@@ -218,7 +212,6 @@ String obtainToken() {
         token = accessToken
         log.warn("$M Keycloak НЕ вернул id_token, используем access_token!")
     } else {
-        log.error("$M Keycloak вернул 200, но нет ни id_token, ни access_token!")
         throw new RuntimeException("$M No token in Keycloak response")
     }
 
@@ -233,7 +226,16 @@ try {
     log.info("$M ==================== СТАРТ ====================")
 
     String nifiUrl    = cfg('NIFI_URL',    'https://svc.nifi').replaceAll('/+$', '')
-    String outputFile = cfg('OUTPUT_FILE', '/tmp/nifi-history.json')
+    String outputFileRaw = cfg('OUTPUT_FILE', '/tmp/nifi-history.json')
+    
+    // Формируем имя файла для отфильтрованных данных
+    String outputFileFiltered = outputFileRaw
+    if (outputFileRaw.endsWith('.json')) {
+        outputFileFiltered = outputFileRaw.replace('.json', '_filtered.json')
+    } else {
+        outputFileFiltered = outputFileRaw + '_filtered.json'
+    }
+
     boolean ta        = cfgBool('TRUST_ALL_TLS',   false)
     boolean logJson   = cfgBool('LOG_REPORT_JSON', false)
     int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
@@ -251,10 +253,6 @@ try {
     if (pageSize <= 0) throw new RuntimeException("$M HISTORY_PAGE_SIZE должно быть > 0")
     if (maxPages <= 0) throw new RuntimeException("$M MAX_PAGES должно быть > 0")
 
-    if (filterMinutes > 0 && filterTimestampStr) {
-        log.warn("$M ВНИМАНИЕ: Заданы оба фильтра времени. Используется FILTER_MINUTES_AGO, FILTER_TIMESTAMP_START игнорируется.")
-    }
-
     // Вычисляем Timestamp отсечки
     long thresholdMs = 0L
     if (filterMinutes > 0) {
@@ -268,8 +266,7 @@ try {
         log.info("$M Фильтр по времени: начиная с $filterTimestampStr ($thresholdMs)")
     }
 
-    if (filterType) log.info("$M Фильтр по типу: $filterType")
-    if (filterUser) log.info("$M Фильтр по пользователю: $filterUser")
+    log.info("$M [DEBUG] Настройки: filterType='${filterType}', filterUser='${filterUser}'")
 
     // 1) Токен
     String bearer = obtainToken()
@@ -281,7 +278,8 @@ try {
     int pageNum = 0
     boolean keepFetching = true
 
-    List<Map> filteredActions = []
+    List<Map> allRawActions = []
+    List<Map> filteredProcessors = []
     List<String> errors = []
     Set<String> seenIds = new HashSet<>()
 
@@ -296,41 +294,55 @@ try {
             url += "&startDate=${enc(sd)}"
         }
 
+        log.info("$M [DEBUG] Запрашиваем страницу $pageNum (offset=$offset): $url")
         Map r = httpGet(url, bearer, ta, cto, rto)
         
         if (r.status == 401 || r.status == 403) {
-            String msg = "NiFi ${r.status} при запросе истории. Проверьте права токена."
-            log.error("$M $msg")
-            errors << msg
-            break
+            throw new RuntimeException("$M NiFi ${r.status} при запросе истории. Проверьте права токена.")
         }
         if (!(r.status in 200..299)) {
-            String msg = "История NiFi недоступна: HTTP ${r.status}. Ответ: ${r.body}"
-            log.warn("$M $msg")
-            errors << msg
-            break
+            throw new RuntimeException("$M История NiFi недоступна: HTTP ${r.status}. Ответ: ${r.body}")
         }
         if (!(r.json instanceof Map) || !(r.json.history?.actions instanceof List)) {
-            String msg = "NiFi вернул 200, но структура ответа не содержит ожидаемый history.actions. Проверьте URL."
-            log.error("$M $msg")
-            errors << msg
-            break
+            throw new RuntimeException("$M NiFi вернул 200, но структура ответа не содержит history.actions. Проверьте URL.")
         }
 
         int total = (r.json.history.total ?: 0) as int
         List actions = r.json.history.actions as List
         
+        log.info("$M [DEBUG] Страница $pageNum: получено ${actions.size()} записей (всего в NiFi по запросу: $total)")
+
         if (actions.isEmpty()) {
             break 
         }
+
+        // Сохраняем в сырой дамп вообще всё, что пришло с этой страницы
+        allRawActions.addAll(actions)
+
+        // Дебаг: смотрим, какие вообще типы сущностей нам прислал NiFi
+        List<String> typesInBatch = actions.collect { it.sourceType?.toString() ?: 'NULL' }.unique()
+        log.info("$M [DEBUG] Уникальные sourceType на странице $pageNum: ${typesInBatch}")
+
+        int passedTimeCheck = 0
+        int passedSourceTypeCheck = 0
+        int passedAllFilters = 0
 
         for (Map action : actions) {
             long actTs = parseNifiTime(action.timestamp?.toString())
 
             if (thresholdMs > 0 && actTs > 0 && actTs < thresholdMs) {
                 keepFetching = false
-                break
+                break // Старая запись, прерываем вообще весь цикл пагинации
             }
+            passedTimeCheck++
+
+            String sType = action.sourceType?.toString() ?: ''
+            
+            // ВАЖНО: Регистронезависимая проверка на Processor!
+            if (!sType.equalsIgnoreCase('Processor')) {
+                continue
+            }
+            passedSourceTypeCheck++
 
             boolean match = true
 
@@ -339,9 +351,8 @@ try {
                 match = false
             }
 
-            // Фильтр по типу процессора (точное совпадение или суффикс)
+            // Фильтр по типу процессора
             if (match && filterType) {
-                String sType = action.sourceType?.toString() ?: ''
                 String t1 = action.componentDetails?.type?.toString() ?: ''
                 String t2 = action.actionDetails?.type?.toString() ?: ''
                 String f = filterType.toLowerCase()
@@ -350,82 +361,56 @@ try {
                     t && (t.toLowerCase() == f || t.toLowerCase().endsWith("." + f))
                 }
 
-                if (sType != 'Processor' || !typeMatch) {
+                if (!typeMatch) {
                     match = false
                 }
             }
 
-            // Дедупликация (пропускаем пустые ID без ошибки)
             if (match) {
                 String actionId = action.id?.toString()
                 if (!actionId || seenIds.add(actionId)) {
-                    filteredActions << action
+                    passedAllFilters++
+                    filteredProcessors << [
+                        actionId      : actionId,
+                        id            : action.sourceId,
+                        name          : action.sourceName,
+                        type          : action.componentDetails?.type ?: action.actionDetails?.type,
+                        lastChangedBy : action.userIdentity,
+                        lastChangedAt : action.timestamp,
+                        lastChangedOp : action.operation,
+                        _rawAction    : action
+                    ]
                 }
             }
         }
+        
+        log.info("$M [DEBUG] Итог страницы $pageNum: осталось после времени=$passedTimeCheck, из них процессоров=$passedSourceTypeCheck, прошло все фильтры=$passedAllFilters")
         
         if (offset + actions.size() >= total) {
             keepFetching = false
         }
 
         if (keepFetching) {
-            offset += actions.size() // Умный сдвиг на размер полученного, а не запрашиваемого
-            if (pageNum % 10 == 0) {
-                log.info("$M Обработано страниц: $pageNum, смещение: $offset ...")
-            }
+            offset += actions.size() 
         }
     }
 
-    // Проверяем, не уперлись ли мы в лимит
     boolean limitReached = (pageNum >= maxPages && keepFetching)
     if (limitReached) {
-        String msg = "Достигнут лимит страниц ($maxPages). Выгрузка остановлена досрочно."
+        String msg = "Достигнут лимит страниц ($maxPages)."
         log.warn("$M $msg")
         errors << msg
     }
 
     boolean isPartial = limitReached || !errors.isEmpty()
 
-    // 3) Формируем отчет
-    Map report = [
+    // ---------------------------------------------------------
+    // ЗАПИСЬ СЫРОГО ФАЙЛА (ВЕСЬ ДАМП БЕЗ ФИЛЬТРОВ)
+    // ---------------------------------------------------------
+    Map rawReport = [
         generatedAt   : Instant.now().toString(),
         nifiUrl       : nifiUrl,
-        partialReport : isPartial,
-        totalActions  : filteredActions.size(),
-        errorsCount   : errors.size(),
-        errors        : errors,
-        actions       : filteredActions
+        totalRawActions: allRawActions.size(),
+        actions       : allRawActions
     ]
-
-    String json = JsonOutput.prettyPrint(JsonOutput.toJson(report))
-
-    // 4) Вывод (Размер файла не контролируется)
-    if (outputFile) {
-        new File(outputFile).with { f ->
-            f.parentFile?.mkdirs()
-            f.setText(json, 'UTF-8')
-        }
-        log.info("$M Файл: $outputFile (${json.length()} bytes)")
-    }
-    if (logJson) {
-        log.info("$M JSON_REPORT_BEGIN")
-        log.info(json)
-        log.info("$M JSON_REPORT_END")
-    }
-
-    log.info("$M -------------------- ИТОГО --------------------")
-    log.info("$M Событий найдено: ${filteredActions.size()}")
-    log.info("$M Страниц скачано: $pageNum")
-    log.info("$M Ошибок/Ворнингов: ${errors.size()}")
-    if (isPartial) {
-        log.warn("$M ВНИМАНИЕ: Отчет сформирован частично (partialReport=true)!")
-    }
-    if (errors) {
-        errors.each { e -> log.warn("$M   ⚠ $e") }
-    }
-    log.info("$M ==================== ГОТОВО ====================")
-
-} catch (Throwable t) {
-    log.error("$M FATAL: ${t.message}", t)
-    throw t
-}
+    // Для raw-файла используем компактный JSON, чтобы
