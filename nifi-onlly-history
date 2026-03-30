@@ -413,4 +413,45 @@ try {
         totalRawActions: allRawActions.size(),
         actions       : allRawActions
     ]
-    // Для raw-файла используем компактный JSON, чтобы
+    // Для raw-файла используем компактный JSON, чтобы не раздувать диск, если записей сотни тысяч
+    new File(outputFileRaw).with { f ->
+        f.parentFile?.mkdirs()
+        f.setText(JsonOutput.toJson(rawReport), 'UTF-8')
+    }
+    log.info("$M [RAW] Сохранен полный дамп API: $outputFileRaw (${allRawActions.size()} сырых записей)")
+
+    // ---------------------------------------------------------
+    // ЗАПИСЬ ОТФИЛЬТРОВАННОГО ФАЙЛА (ДЛЯ ГРАФАНЫ)
+    // ---------------------------------------------------------
+    Map filteredReport = [
+        generatedAt    : Instant.now().toString(),
+        nifiUrl        : nifiUrl,
+        partialReport  : isPartial,
+        totalProcessors: filteredProcessors.size(), 
+        errorsCount    : errors.size(),
+        errors         : errors,
+        processors     : filteredProcessors
+    ]
+    String filteredJson = JsonOutput.prettyPrint(JsonOutput.toJson(filteredReport))
+    
+    new File(outputFileFiltered).with { f ->
+        f.setText(filteredJson, 'UTF-8')
+    }
+    log.info("$M [FILTERED] Сохранен результат с фильтрами: $outputFileFiltered (${filteredProcessors.size()} процессоров)")
+
+    // ---------------------------------------------------------
+    // ИТОГИ В ЛОГ
+    // ---------------------------------------------------------
+    log.info("$M ==================== ИТОГИ ====================")
+    log.info("$M Всего скачано сырых событий: ${allRawActions.size()}")
+    log.info("$M Из них осталось процессоров: ${filteredProcessors.size()}")
+    log.info("$M Страниц скачано:             $pageNum")
+    if (errors) {
+        errors.each { e -> log.warn("$M   ⚠ $e") }
+    }
+    log.info("$M ==================== ГОТОВО ====================")
+
+} catch (Throwable t) {
+    log.error("$M FATAL: ${t.message}", t)
+    throw t
+}
