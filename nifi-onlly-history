@@ -1,3 +1,4 @@
+// GENERATED AT: 2026-03-30 14:49 CEST
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.Field
@@ -157,9 +158,8 @@ String obtainToken() {
     int rto = cfgInt('READ_TIMEOUT_MS', 30000)
 
     if (!clientId || !secret) {
-        String msg = "$M [ОШИБКА КОНФИГУРАЦИИ] Блок: Авторизация. KEYCLOAK_CLIENT_ID и KEYCLOAK_CLIENT_SECRET не заданы."
-        System.err.println(msg)
-        throw new RuntimeException(msg)
+        System.err.println("$M [ОШИБКА КОНФИГУРАЦИИ] Блок: Авторизация. KEYCLOAK_CLIENT_ID и KEYCLOAK_CLIENT_SECRET не заданы.")
+        return null
     }
 
     String tokenUrl = "${kcUrl}/realms/${enc(realm)}/protocol/openid-connect/token"
@@ -170,16 +170,14 @@ String obtainToken() {
         String body = "grant_type=client_credentials&client_id=${enc(clientId)}&client_secret=${enc(secret)}&scope=openid"
         resp = http('POST', tokenUrl, null, body, ['Content-Type':'application/x-www-form-urlencoded'], ta, cto, rto)
     } catch (Throwable t) {
-        String msg = "$M [СЕТЕВАЯ ОШИБКА] Блок: Подключение к Keycloak. URL: $tokenUrl. Ошибка: ${t.message}"
-        System.err.println(msg)
-        throw new RuntimeException(msg)
+        System.err.println("$M [СЕТЕВАЯ ОШИБКА] Блок: Подключение к Keycloak. URL: $tokenUrl. Ошибка: ${t.message}")
+        return null
     }
 
     if (!(resp.status in 200..299)) {
         String safeBody = truncateBody(resp.body)
-        String msg = "$M [ОШИБКА KEYCLOAK] Блок: Получение токена. Ожидали 200, получили HTTP ${resp.status}. Ответ сервера: $safeBody"
-        System.err.println(msg)
-        throw new RuntimeException(msg)
+        System.err.println("$M [ОШИБКА KEYCLOAK] Блок: Получение токена. Ожидали 200, получили HTTP ${resp.status}. Ответ сервера: $safeBody")
+        return null
     }
 
     String idToken     = resp.json?.id_token
@@ -195,7 +193,241 @@ String obtainToken() {
         System.err.println("$M WARNING: Keycloak НЕ вернул id_token, используем access_token!")
     } else {
         String safeBody = truncateBody(resp.body)
-        String msg = "$M [ОШИБКА ТОКЕНА] Блок: Разбор ответа Keycloak. Сервер вернул 200, но внутри нет ни id_token, ни access_token. Ответ: $safeBody"
-        System.err.println(msg)
-        throw new RuntimeException(msg)
+        System.err.println("$M [ОШИБКА ТОКЕНА] Блок: Разбор ответа Keycloak. Сервер вернул 200, но внутри нет ни id_token, ни access_token. Ответ: $safeBody")
+        return null
     }
+
+    tokenCache.token     = token
+    tokenCache.expiresAt = now + expiresIn * 1000L
+    return token
+}
+
+// ======================== MAIN ========================
+
+try {
+    System.out.println("$M ==================== СТАРТ ====================")
+
+    String nifiUrl    = cfg('NIFI_URL',    '[https://svc.nifi](https://svc.nifi)').replaceAll('/+$', '')
+    String outputFileRaw = cfg('OUTPUT_FILE', '/tmp/nifi-history.json')
+    
+    // Формируем имя файла для отфильтрованных данных
+    String outputFileFiltered = outputFileRaw
+    if (outputFileRaw.endsWith('.json')) {
+        outputFileFiltered = outputFileRaw.replace('.json', '_filtered.json')
+    } else {
+        outputFileFiltered = outputFileRaw + '_filtered.json'
+    }
+
+    boolean ta        = cfgBool('TRUST_ALL_TLS',   false)
+    int cto = cfgInt('CONNECT_TIMEOUT_MS', 10000)
+    int rto = cfgInt('READ_TIMEOUT_MS',    30000)
+
+    // --- Параметры фильтрации ---
+    String filterType         = cfg('FILTER_PROCESSOR_TYPE', '')
+    String filterUser         = cfg('FILTER_USER_IDENTITY', '')
+    int filterMinutes         = cfgInt('FILTER_MINUTES_AGO', 0)
+    String filterTimestampStr = cfg('FILTER_TIMESTAMP_START', '')
+    
+    int pageSize = cfgInt('HISTORY_PAGE_SIZE', 1000)
+    int maxPages = cfgInt('MAX_PAGES', 1000)
+
+    if (pageSize <= 0) {
+        System.err.println("$M [ОШИБКА КОНФИГУРАЦИИ] HISTORY_PAGE_SIZE должно быть > 0")
+        return
+    }
+    if (maxPages <= 0) {
+        System.err.println("$M [ОШИБКА КОНФИГУРАЦИИ] MAX_PAGES должно быть > 0")
+        return
+    }
+
+    // Вычисляем Timestamp отсечки
+    long thresholdMs = 0L
+    if (filterMinutes > 0) {
+        thresholdMs = System.currentTimeMillis() - (filterMinutes * 60_000L)
+        System.out.println("$M Фильтр по времени: изменения за последние $filterMinutes мин.")
+    } else if (filterTimestampStr) {
+        thresholdMs = parseNifiTime(filterTimestampStr)
+        if (thresholdMs == 0L) {
+            System.err.println("$M [ОШИБКА КОНФИГУРАЦИИ] Неверный формат FILTER_TIMESTAMP_START: '$filterTimestampStr'. Парсер вернул 0.")
+            return
+        }
+        System.out.println("$M Фильтр по времени: начиная с $filterTimestampStr ($thresholdMs)")
+    }
+
+    System.out.println("$M Фильтры -> Тип: '${filterType}', Юзер: '${filterUser}'")
+
+    // 1) Токен
+    String bearer = obtainToken()
+    if (!bearer) {
+        System.err.println("$M [ОСТАНОВКА] Не удалось получить токен. Скрипт прерван.")
+        return
+    }
+
+    // 2) Вытаскиваем историю
+    System.out.println("$M Запрос глобальной истории NiFi...")
+    
+    int offset = 0
+    int pageNum = 0
+    boolean keepFetching = true
+
+    List<Map> allRawActions = []
+    List<Map> filteredRecords = []
+    List<String> errors = []
+    Set<String> seenIds = new HashSet<>()
+
+    while (keepFetching && pageNum < maxPages) {
+        pageNum++
+        
+        String url = "$nifiUrl/nifi-api/flow/history?offset=$offset&count=$pageSize&sortColumn=timestamp&sortOrder=desc"
+        if (thresholdMs > 0) {
+            SimpleDateFormat sdf = new SimpleDateFormat("MM/dd/yyyy HH:mm:ss z", Locale.US)
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"))
+            String sd = sdf.format(new Date(thresholdMs))
+            url += "&startDate=${enc(sd)}"
+        }
+
+        System.out.println("$M Запрашиваем страницу $pageNum (offset=$offset): $url")
+        Map r = http('GET', url, bearer, null, null, ta, cto, rto)
+        
+        // ЧЕТКИЕ СООБЩЕНИЯ ПРИ ОШИБКАХ API (Без выкидывания Exception)
+        if (r.status == 401 || r.status == 403) {
+            String safeBody = truncateBody(r.body)
+            String errMsg = "$M [ОШИБКА ДОСТУПА API] Блок: Запрос истории. Страница: $pageNum. URL: $url. Ожидали 200, получили HTTP ${r.status}. Тело ответа: $safeBody"
+            System.err.println(errMsg)
+            errors << errMsg
+            break
+        }
+        if (!(r.status in 200..299)) {
+            String safeBody = truncateBody(r.body)
+            String errMsg = "$M [ОШИБКА СЕРВЕРА API] Блок: Запрос истории. Страница: $pageNum. Ожидали 2xx, получили HTTP ${r.status}. Тело ответа: $safeBody"
+            System.err.println(errMsg)
+            errors << errMsg
+            break
+        }
+        if (!(r.json instanceof Map) || !(r.json.history?.actions instanceof List)) {
+            String safeBody = truncateBody(r.body)
+            String errMsg = "$M [ОШИБКА СТРУКТУРЫ JSON] Блок: Парсинг ответа NiFi. Страница: $pageNum. Ожидали JSON-объект с массивом 'history.actions'. Получили структуру ключей: ${r.json?.keySet()}. Сырой ответ: $safeBody"
+            System.err.println(errMsg)
+            errors << errMsg
+            break
+        }
+
+        int total = (r.json.history.total ?: 0) as int
+        List actions = r.json.history.actions as List
+        
+        System.out.println("$M Страница $pageNum: получено ${actions.size()} записей (всего доступно: $total)")
+
+        if (actions.isEmpty()) {
+            break 
+        }
+
+        // Сохраняем всё в сырой дамп
+        allRawActions.addAll(actions)
+
+        for (Map action : actions) {
+            long actTs = parseNifiTime(action.timestamp?.toString())
+
+            if (thresholdMs > 0 && actTs > 0 && actTs < thresholdMs) {
+                keepFetching = false
+                break
+            }
+
+            boolean match = true
+
+            // Фильтр по пользователю
+            if (filterUser && action.userIdentity != filterUser) {
+                match = false
+            }
+
+            // Фильтр по типу (ищем в componentDetails и actionDetails)
+            if (match && filterType) {
+                String t1 = action.componentDetails?.type?.toString() ?: ''
+                String t2 = action.actionDetails?.type?.toString() ?: ''
+                String f = filterType.toLowerCase()
+
+                boolean typeMatch = [t1, t2].any { t ->
+                    t && (t.toLowerCase() == f || t.toLowerCase().endsWith("." + f))
+                }
+
+                if (!typeMatch) {
+                    match = false
+                }
+            }
+
+            if (match) {
+                String actionId = action.id?.toString()
+                if (!actionId || seenIds.add(actionId)) {
+                    filteredRecords << action
+                }
+            }
+        }
+        
+        if (offset + actions.size() >= total) {
+            keepFetching = false
+        }
+
+        if (keepFetching) {
+            offset += actions.size() 
+        }
+    }
+
+    boolean limitReached = (pageNum >= maxPages && keepFetching)
+    if (limitReached) {
+        String msg = "$M [ЛИМИТ] Достигнут лимит страниц ($maxPages). Выгрузка остановлена досрочно."
+        System.err.println(msg)
+        errors << msg
+    }
+
+    // ---------------------------------------------------------
+    // ЗАПИСЬ СЫРОГО ФАЙЛА
+    // ---------------------------------------------------------
+    Map rawReport = [
+        generatedAt    : Instant.now().toString(),
+        nifiUrl        : nifiUrl,
+        totalRawActions: allRawActions.size(),
+        actions        : allRawActions
+    ]
+    new File(outputFileRaw).with { f ->
+        f.parentFile?.mkdirs()
+        f.setText(JsonOutput.toJson(rawReport), 'UTF-8')
+    }
+    System.out.println("$M [RAW] Сохранен полный сырой дамп: $outputFileRaw (${allRawActions.size()} записей)")
+
+    // ---------------------------------------------------------
+    // ЗАПИСЬ ОТФИЛЬТРОВАННОГО ФАЙЛА
+    // ---------------------------------------------------------
+    boolean isPartial = limitReached || !errors.isEmpty()
+    Map filteredReport = [
+        generatedAt    : Instant.now().toString(),
+        nifiUrl        : nifiUrl,
+        partialReport  : isPartial,
+        totalActions   : filteredRecords.size(), 
+        errorsCount    : errors.size(),
+        errors         : errors,
+        actions        : filteredRecords
+    ]
+    String filteredJson = JsonOutput.prettyPrint(JsonOutput.toJson(filteredReport))
+    
+    new File(outputFileFiltered).with { f ->
+        f.setText(filteredJson, 'UTF-8')
+    }
+    System.out.println("$M [FILTERED] Сохранен отфильтрованный результат: $outputFileFiltered (${filteredRecords.size()} записей)")
+
+    // ---------------------------------------------------------
+    // ИТОГИ В КОНСОЛЬ
+    // ---------------------------------------------------------
+    System.out.println("$M ==================== ИТОГИ ====================")
+    System.out.println("$M Всего скачано сырых событий: ${allRawActions.size()}")
+    System.out.println("$M После фильтрации осталось:   ${filteredRecords.size()}")
+    System.out.println("$M Страниц скачано:             $pageNum")
+    if (isPartial) {
+        System.err.println("$M WARNING: Отчет сформирован частично (были ошибки или лимиты)!")
+    }
+    if (errors) {
+        errors.each { e -> System.err.println("$M ⚠ ОШИБКА В ПРОЦЕССЕ: $e") }
+    }
+    System.out.println("$M ==================== ГОТОВО ====================")
+
+} catch (Throwable t) {
+    System.err.println("$M [КРИТИЧЕСКАЯ ОШИБКА] Скрипт упал с исключениями. Описание: ${t.message}")
+}
