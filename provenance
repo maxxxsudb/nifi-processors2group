@@ -1,4 +1,3 @@
-// GENERATED AT: 2026-04-14
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.Field
@@ -186,13 +185,19 @@ String obtainToken() {
 
 // ======================== PROVENANCE API ========================
 
-List<Map> getProvenance(String nifiUrl, String bearer, String startDateStr, int maxResults, boolean ta, int cto, int rto) {
+List<Map> getProvenance(String nifiUrl, String bearer, String startDateStr, int maxResults, String eventType, boolean ta, int cto, int rto) {
     String postUrl = "${nifiUrl}/nifi-api/provenance"
     
+    Map searchTerms = [:]
+    if (eventType) {
+        searchTerms['EventType'] = eventType
+    }
+
     Map reqObj = [
         maxResults: maxResults,
-        searchTerms: [:]
+        searchTerms: searchTerms
     ]
+    
     if (startDateStr) {
         reqObj.startDate = startDateStr
     }
@@ -251,7 +256,8 @@ try {
 
     int filterMinutes         = cfgInt('FILTER_MINUTES_AGO', 0)
     String filterTimestampStr = cfg('FILTER_TIMESTAMP_START', '')
-    int maxResults            = cfgInt('PROVENANCE_MAX_RESULTS', 1000) // Лимит событий NiFi
+    int maxResults            = cfgInt('PROVENANCE_MAX_RESULTS', 1000)
+    String filterEventType    = cfg('FILTER_EVENT_TYPE', '')
 
     // Вычисляем стартовую дату для Provenance
     long thresholdMs = 0L
@@ -271,7 +277,7 @@ try {
     }
 
     // 2) Запрос Provenance
-    List<Map> globalEvents = getProvenance(nifiUrl, bearer, startDateNifi, maxResults, ta, cto, rto)
+    List<Map> globalEvents = getProvenance(nifiUrl, bearer, startDateNifi, maxResults, filterEventType, ta, cto, rto)
     System.out.println("$M Всего получено событий Provenance: ${globalEvents.size()}")
 
     if (globalEvents.isEmpty()) {
