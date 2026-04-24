@@ -1,0 +1,2 @@
+- name: ADDITIONAL_JVM_ARGS
+    value: "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
